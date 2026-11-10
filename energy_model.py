@@ -47,7 +47,12 @@ def calculate_energy_model():
     print(df[['energy_consumed_kWh', 'solar_irradiance_W_m2', 'pv_power_kW', 'wind_speed_m_s', 'wind_power_kW']].head(5))
     
     # Print informative note about full dataset availability in memory
-    print("\nNote: The complete 8760-hour time-series is stored in the returned DataFrame.")
+    print("\nNote: The complete 8760-hour time-series is stored in thefindstr wind_speed_unit gestor_dados.py returned DataFrame.")
+    
+    # Export the complete calculated dataset to CSV for the next phase (Optimization)
+    output_path = "data/energy_model_output.csv"
+    df.to_csv(output_path)
+    print(f"[SUCCESS] Consolidated energy model exported to '{output_path}'.")
     print("--------------------------------------------------")
     
     # Return full calculated dataframe
