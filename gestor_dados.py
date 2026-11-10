@@ -80,5 +80,3 @@ if __name__ == "__main__":
     print(f"\nTotal hours in dataset: {len(df)}")
     print("\nFirst 5 hours of energy consumption profile:")
     print(df.head())
-
-
