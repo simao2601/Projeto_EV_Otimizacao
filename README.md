@@ -10,6 +10,7 @@ This repository contains the software modules for the **Renewable Micro-installa
 .
 ├── gestor_dados.py            # Phase 1: data pipeline (ETL)
 ├── energy_model.py            # Phase 2: PV and wind energy conversion model
+├── optimizer.py               # Phase 3: PV, wind and battery sizing optimization (LP)
 ├── requirements.txt           # Python dependencies
 ├── README.md
 └── data/
@@ -17,7 +18,10 @@ This repository contains the software modules for the **Renewable Micro-installa
     ├── processed_ev_demand_2025.csv     # Hourly EV demand of station ST013
     ├── processed_weather_2025.csv       # Hourly weather data (Open-Meteo)
     ├── processed_dataset_2025.csv       # Phase 1 output (demand + weather, 8760 rows)
-    └── energy_model_output.csv          # Phase 2 output (Phase 1 + PV and wind power, 8760 rows)
+    ├── energy_model_output.csv          # Phase 2 output (Phase 1 + PV and wind power, 8760 rows)
+    ├── optimization_results_hourly.csv          # Phase 3 output (created by optimizer.py)
+    ├── optimization_summary.csv                 # Phase 3 output (created by optimizer.py)
+    └── optimization_self_sufficiency_sweep.csv  # Phase 3 output (created by optimizer.py)
 ```
 
 ## Getting Started
@@ -34,9 +38,10 @@ pip install -r requirements.txt
 ```bash
 python gestor_dados.py
 python energy_model.py
+python optimizer.py
 ```
 
-Note: `gestor_dados.py` skips the processing (and the API request) if `data/processed_dataset_2025.csv` already exists. To regenerate it, delete that file first. The processed files are already included in the repository, so it is not necessary to run the scripts just to start working on Phase 3.
+Note: `gestor_dados.py` skips the processing (and the API request) if `data/processed_dataset_2025.csv` already exists. To regenerate it, delete that file first. The processed files are already included in the repository, so it is not necessary to run the first two scripts just to run the optimization.
 
 ## Phase 1: Data Management
 
@@ -118,9 +123,89 @@ Since the time step is 1 hour, a power of 1 kW during one hour corresponds to 1 
 * **Wind turbine:** a single generic power curve (cut-in 3 m/s, rated 12 m/s, cut-out 25 m/s) is used, with no losses.
 * **Location and year:** weather data is for Warsaw (2025) as a representative location in Poland, while the charging data belongs to station ST013.
 
-## Phase 3: Optimization and Costs
+## Phase 3: Optimization and Costs (`optimizer.py`)
 
-This phase consumes the data from the previous phases, either the in-memory DataFrame returned by `calculate_energy_model()` or the CSV `data/energy_model_output.csv`, to apply economic optimization algorithms and to size the battery storage system (together with the PV and wind capacities).
+This module reads `data/energy_model_output.csv` and finds the PV capacity, wind capacity and battery capacity that minimize the total annual cost of supplying station ST013. The problem is a **Linear Program (LP)** over the 8760 hours of the year, built with [PuLP](https://coin-or.github.io/pulp/) and solved with [HiGHS](https://highs.dev/) (about 52 000 variables and constraints, solved in a few seconds).
+
+### Decision Variables
+
+* **Sizing:** installed PV capacity $P_{pv}$ (kW), installed wind capacity $P_{wind}$ (kW) and battery capacity $E_{bess}$ (kWh).
+* **Hourly operation** (for every hour $t$, all $\geq 0$): grid import $g^{imp}_t$, export to the grid $g^{exp}_t$, curtailed surplus $c_t$, battery charge $ch_t$, battery discharge $dis_t$ and state of charge $soc_t$ (kWh).
+
+### Objective Function
+
+Minimize the **Equivalent Annual Cost (EAC)**, which spreads each investment over its lifetime and adds the yearly operation:
+
+$$\min \; a_{pv} P_{pv} + a_{wind} P_{wind} + a_{bess} E_{bess} + \pi^{imp} \sum_t g^{imp}_t - \pi^{exp} \sum_t g^{exp}_t$$
+
+where $a_k = CAPEX_k \cdot CRF(r, n_k) + OPEX_k$ is the annual cost of 1 kW (or 1 kWh) of technology $k$, and $CRF(r, n) = \frac{r(1+r)^n}{(1+r)^n - 1}$ is the capital recovery factor for a discount rate $r$ and a lifetime of $n$ years.
+
+### Constraints
+
+* **Energy balance (every hour):** $P_{pv} \cdot pv_t + P_{wind} \cdot wind_t + g^{imp}_t + dis_t = demand_t + ch_t + g^{exp}_t + c_t$
+* **Battery state of charge:** $soc_t = soc_{t-1} + \eta_{ch} \cdot ch_t - dis_t / \eta_{dis}$. The year is cyclic (the battery ends the year with the same charge it started with), so there is no free initial energy.
+* **State of charge limits:** $SoC_{min} \cdot E_{bess} \leq soc_t \leq SoC_{max} \cdot E_{bess}$
+* **Battery power limits:** $ch_t \leq C_{rate} \cdot E_{bess}$ and $dis_t \leq C_{rate} \cdot E_{bess}$
+* **Optional:** maximum generation capacity $P_{pv} + P_{wind} \leq 50$ kW (Polish *mikroinstalacja* limit), minimum self-sufficiency $\sum_t g^{imp}_t \leq (1 - f_{min}) \sum_t demand_t$, grid import and export limits (`grid_import_max_kW=0` simulates an off-grid station) and upper bounds on each capacity.
+
+### Default Parameters
+
+All values are set in the `Parameters` class. The costs are reference estimates (EUR, 2025 prices, small commercial installations) and should be replaced by values with a cited source in the final report.
+
+| Parameter | Default value | Field in `Parameters` |
+|---|---|---|
+| PV: CAPEX / OPEX / lifetime | 750 €/kW / 15 €/kW/year / 25 years | `pv` |
+| Wind (small turbines): CAPEX / OPEX / lifetime | 3500 €/kW / 70 €/kW/year / 20 years | `wind` |
+| Battery (LFP, with inverter): CAPEX / OPEX / lifetime | 350 €/kWh / 7 €/kWh/year / 12 years | `bess` |
+| Discount rate | 6% | `discount_rate` |
+| Grid import price | 0.22 €/kWh | `grid_import_price` |
+| Grid export price | 0 €/kWh (0.06 €/kWh in the net-billing scenario) | `grid_export_price` |
+| Battery charge / discharge efficiency | 0.95 / 0.95 (about 90% round trip) | `eta_charge`, `eta_discharge` |
+| Battery state of charge limits | 10% to 90% | `soc_min`, `soc_max` |
+| Battery C-rate | 0.5 (kW per kWh of capacity) | `c_rate` |
+| Maximum PV + wind capacity | no limit (50 kW in the net-billing scenario) | `max_generation_kW` |
+
+### Scenarios
+
+Running `python optimizer.py` solves two cases:
+
+1. **Net-billing (main scenario):** surplus energy is sold to the grid at 0.06 €/kWh, and the installed PV + wind capacity is limited to 50 kW to comply with the Polish *mikroinstalacja* legislation.
+2. **Cost vs self-sufficiency (sensitivity analysis):** the model is solved for minimum self-sufficiency targets of 0%, 25%, 50%, 75% and 100% (share of the EV demand not bought from the grid). This sweep uses no export payment and no capacity limit, so it shows the cost of supplying the station with its own renewable energy. The output table also indicates which solutions fit within the 50 kW limit.
+
+### Usage Example
+
+```python
+from dataclasses import replace
+from optimizer import Parameters, net_billing_parameters, run_optimization, self_sufficiency_sweep
+
+# Main scenario: returns a summary dict and an hourly DataFrame
+summary, hourly = run_optimization(net_billing_parameters())
+print(summary["PV capacity [kW]"], summary["Total annual cost [EUR/yr]"])
+
+# Custom scenarios
+summary, hourly = run_optimization(Parameters(grid_import_max_kW=0))   # off-grid station
+summary, hourly = run_optimization(replace(net_billing_parameters(), grid_export_price=0.05))
+
+# Cost vs self-sufficiency table (pandas DataFrame)
+sweep = self_sufficiency_sweep()
+```
+
+### Output Files
+
+| File | Content |
+|---|---|
+| `data/optimization_summary.csv` | Net-billing scenario: installed capacities, investment, annual costs and indicators (self-sufficiency, export, curtailment, battery cycles, savings compared with buying all energy from the grid) |
+| `data/optimization_results_hourly.csv` | Net-billing scenario: hourly operation (demand, PV and wind production, grid import, export, curtailment, battery charge, discharge and state of charge) |
+| `data/optimization_self_sufficiency_sweep.csv` | Optimal system and cost for each self-sufficiency target |
+
+### Modeling Assumptions and Limitations
+
+* **Perfect foresight:** the model knows the demand and the weather of the whole year in advance, so the battery operation is the best possible one. Real operation would be somewhat worse.
+* **Continuous sizes:** capacities are not rounded to commercial panel, turbine or battery sizes. Discrete sizes would need integer variables (MILP).
+* **Flat prices:** a single import price and a single export price are used, without time-of-use tariffs, contracted power charges or hourly market prices.
+* **No degradation:** PV and battery degradation are not modeled. Battery replacement is included only through its 12-year lifetime in the annual cost.
+* **Unbounded problem:** if the export price is higher than the cost of the energy produced by PV or wind, the optimal solution would be to install an infinite capacity. For this reason, a paid export always needs a capacity limit (`max_generation_kW` or `grid_export_max_kW`).
+* **Input data:** the results inherit the assumptions of Phases 1 and 2 (wind at 10 m height, PV without losses). `load_data()` warns if the mean wind speed looks like km/h instead of m/s.
 
 ## Team Workflow
 
